@@ -37,22 +37,24 @@ section .data
 	screen_center_x dd 0
 	screen_center_y dd 0
 
-	ball_x dd 0
-	ball_y dd 0
+	ball_pos_x dd 0
+	ball_pos_y dd 0
+	ball_vel_x dd 0
+	ball_vel_y dd 0
 	ball_radius dd 100
 
 	boundary_radius dd 250
 	boundary_thickness dd 25
 
 	theta dd 0.0 ; Determines position of paddle relative to north, in radians. 
-	theta_offset dd 0.1 ; Baisically controls speed at which paddle turns.
+	theta_offset dd 0.05 ; Baisically controls speed at which paddle turns.
 	pi dd 3.14159265
 	cos_pi_over_12 dd 0.9659258 ; cos(pi/12) roughly. Used to determine the width of the paddle.
 
 	paddle_center_x dd 0
 	paddle_center_y dd 0
 
-	moving_state dd 0 ; 0 (still), 1 (clockwise), 2 (anti-clockwise).
+	move_state dd 0 ; 0 (still), 1 (anti-clockwise), 2 (clockwise).
 
 section .bss
     fb_fd resq 1
@@ -77,7 +79,6 @@ _start:
 	;mov rax, SYS_EXIT
 	;xor rdi, rdi
 	;syscall
-	
 
     ; Open framebuffer device.
     mov rax, SYS_OPEN              
@@ -103,7 +104,6 @@ _mainLoop:
 	; call _clearScreen
 	call _drawCircle
 	call _flushScreenBuffer
-	call _computePaddleCenter
 
 	; Read input event.
 	mov rax, SYS_READ
@@ -112,17 +112,24 @@ _mainLoop:
 	mov rdx, 24 ; Number of bytes to read (input event size).
 	syscall
 
-	;cmp rax, 24
-	;jne _mainLoop ; If there is no event to read, restart loop.
-	jmp _processInput
+	cmp rax, 24	
+	jne _mainLoop_noInput
+	mov ax, [kb_buffer + 16]
+	cmp ax, 1
+	jne _mainLoop_noInput
+	call _processInput
+_mainLoop_noInput:
+	call _updateTheta
+	call _computePaddleCenter
+	jmp _mainLoop
 
 _updateTheta:	
 	mov eax, [move_state]	
-	cmp eax, 1 ; Clockwise.
+	cmp eax, 2 ; Clockwise.
 	je _updateTheta_inc
-	cmp eax, 2 ; Anti-clockwise.
+	cmp eax, 1 ; Anti-clockwise.
 	je _updateTheta_dec
-	jmp _updateTheta_end ; Do nothing.
+	ret
 _updateTheta_inc:
 	movss xmm0, [theta]
 	movss xmm1, [theta_offset]
@@ -138,7 +145,7 @@ _updateTheta_inc:
 	jb _updateTheta_end ; If within 2pi, we are fine.
 	subss xmm0, xmm2 ; Subtract 2pi.
 	movss dword [theta], xmm0
-	jmp _updateTheta_end
+	ret
 _updateTheta_dec:
 	movss xmm0, [theta]
 	movss xmm1, [theta_offset]
@@ -149,41 +156,43 @@ _updateTheta_dec:
 	mov eax, 0
 	cvtsi2ss xmm1, eax
 	ucomiss xmm0, xmm1
-	ja _updateTheta_ed ; If greater than 0, we are fine. 
+	ja _updateTheta_end ; If greater than 0, we are fine. 
 	mov eax, 2
 	cvtsi2ss xmm1, eax
 	movss xmm2, [pi]
 	mulss xmm2, xmm1 ; 2pi
 	addss xmm0, xmm2 ; Add 2pi.
 	movss dword [theta], xmm0
-	jmp _updateTheta_end
+	ret
 _updateTheta_end:
 	ret	
 
 _processInput:	
-	movzx eax, word [kb_buffer + 20] ; Value (offset 20 in input_event structure).
+	mov eax, [kb_buffer + 20] ; Value (offset 20 in input_event structure).
 	cmp eax, 0 ; Key release.
 	je _processInput_release
 	cmp eax, 1 ; Key press.
-	je _processInput_press
+	jge _processInput_press
+	ret
 _processInput_release:
 	mov dword [move_state], 0
-	call _updateTheta
+	ret
 _processInput_press:	
-	movzx eax, word [kb_buffer + 18] ; Keycode (offset 18 in input_event structure).
-	cmp eax, KEY_CODE_Q
-	jmp _processInput_quit
-	cmp eax, KEY_CODE_LEFT_ARROW
+	mov ax, [kb_buffer + 18] ; Keycode (offset 18 in input_event structure).
+	cmp ax, KEY_CODE_LEFT_ARROW
 	je _processInput_moveAntiClockwise	
-	sub eax, 104 ; Key codes for left and right arrow are 105 and 106 respectively, so we convert to our move states.
-	mov dword [move_state], eax	
+	cmp ax, KEY_CODE_RIGHT_ARROW
+	je _processInput_moveClockwise
+	cmp ax, KEY_CODE_Q
+	je _processInput_quit
+	ret
 _processInput_moveAntiClockwise:
 	mov dword [move_state], 1	
+	ret
+_processInput_moveClockwise:
+	mov dword [move_state], 2 
+	ret
 _processInput_quit:
-	; Check for quit.
-	cmp eax, KEY_CODE_Q
-	jne _mainLoop
-
 	; Close framebuffer device.
     mov rax, SYS_CLOSE              
     mov rdi, [fb_fd]        
@@ -195,43 +204,6 @@ _processInput_quit:
 	syscall
 
 	call _exit
-
-_rotatePaddleClockwise:
-	movss xmm0, [theta]
-	movss xmm1, [theta_offset]
-	addss xmm0, xmm1 ; Move theta. 	
-	movss dword [theta], xmm0
-	
-	; Now do range check. If over 2pi, subtract 2pi.
-	mov eax, 2
-	cvtsi2ss xmm1, eax
-	movss xmm2, [pi]
-	mulss xmm2, xmm1 ; 2pi
-	ucomiss xmm0, xmm2
-	jb _mainLoop ; If within 2pi, we are fine.
-	subss xmm0, xmm2 ; Subtract 2pi.
-	movss dword [theta], xmm0
-	jmp _mainLoop
-
-_rotatePaddleAntiClockwise:
-	movss xmm0, [theta]
-	movss xmm1, [theta_offset]
-	subss xmm0, xmm1 ; Move theta. 	
-	movss dword [theta], xmm0
-	
-	; Now do range check. If less than 0, add 2pi.
-	mov eax, 0
-	cvtsi2ss xmm1, eax
-	ucomiss xmm0, xmm1
-	ja _mainLoop ; If greater than 0, we are fine. 
-	mov eax, 2
-	cvtsi2ss xmm1, eax
-	movss xmm2, [pi]
-	mulss xmm2, xmm1 ; 2pi
-	addss xmm0, xmm2 ; Add 2pi.
-	movss dword [theta], xmm0
-	jmp _mainLoop
-	
 
 ; Sets entire framebuffer to one colour.
 _clearScreen:
