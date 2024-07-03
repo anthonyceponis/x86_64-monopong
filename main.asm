@@ -13,6 +13,10 @@
 %define SYS_OPEN 2
 %define SYS_LSEEK 8
 %define SYS_CLOSE 3
+%define SYS_FCNTL 72
+
+%define F_GETFL 3
+%define F_SETFL 4
 
 ; Misc.
 %define O_RDONLY 0
@@ -34,14 +38,22 @@ section .data
 	x dd 0
 	y dd 0
 
+	;frame_duration  dq 16666667          ; 60 FPS = 16.666667 ms per frame
+	frame_duration  dq 33333333          ; 30 FPS = 333.33333 ms per frame
+    timespec        dq 0, 0
+    start_time      dq 0, 0
+    end_time        dq 0, 0
+
+	fb_ptr dq 0
+
 	screen_center_x dd 0
 	screen_center_y dd 0
 
-	ball_pos_x dd 0
-	ball_pos_y dd 0
-	ball_vel_x dd 0
-	ball_vel_y dd 0
-	ball_radius dd 100
+	ball_pos_x dd 0.0
+	ball_pos_y dd 0.0
+	ball_vel_x dd 0.0
+	ball_vel_y dd -0.5
+	ball_radius dd 10
 
 	boundary_radius dd 250
 	boundary_thickness dd 25
@@ -57,8 +69,8 @@ section .data
 	move_state dd 0 ; 0 (still), 1 (anti-clockwise), 2 (clockwise).
 
 section .bss
-    fb_fd resq 1
-	kb_fd resq 1
+    fb_fd resd 1
+	kb_fd resd 1
 	staging_buffer resb FB_SIZE
 	kb_buffer resb 24 ; Buffer to hold integer string representation.
 
@@ -78,7 +90,7 @@ _start:
 ;_finish:
 	;mov rax, SYS_EXIT
 	;xor rdi, rdi
-	;syscall
+	;syscall	
 
     ; Open framebuffer device.
     mov rax, SYS_OPEN              
@@ -86,7 +98,7 @@ _start:
     mov rsi, O_RDWR              
     xor rdx, rdx ; Mode (not used).
     syscall                 
-    mov [fb_fd], rax ; Store file descriptor.
+    mov dword [fb_fd], eax ; Store file descriptor.
 
 	; Open keyboard device.
 	mov rax, SYS_OPEN
@@ -94,61 +106,184 @@ _start:
 	mov rsi, O_RDONLY
 	xor rdx, rdx ; Mode (not used).
 	syscall
-	mov [kb_fd], rax ; Store file descriptor.
+	mov dword [kb_fd], eax ; Store file descriptor.
+
+	; Map framebuffer to memory
+    ;mov rdi, 0
+    ;mov rsi, FB_SIZE  ; screensize
+    ;mov rdx, 3 ;  PROT_READ | PROT_WRITE
+    ;mov r10, 1, ; MAP_SHARED
+    ;mov r8, qword [fb_fd]
+    ;mov r9, 0
+    ;mov rax, 9 ; mmap syscall.
+    ;syscall
+    ;mov qword [fb_ptr], rax  ; Save framebuffer pointer
+
 
 	call _computeScreenCenter
-	call _mainLoop   
+	jmp _mainLoop   
     
 _mainLoop:
-	; Update screen.
-	; call _clearScreen
-	call _drawCircle
-	call _flushScreenBuffer
+	; Get start time
+    ;mov rax, 228         ; syscall: clock_gettime
+    ;xor rdi, rdi         ; CLOCK_REALTIME
+    ;lea rsi, [start_time]
+    ;syscall
 
-	; Read input event.
+	; Update screen.
+	call _render
+	call _flushScreenBuffer
+	;call _render2
+	
+	;call _checkForInput 
+	;cmp rax, 0	
+	;jle _mainLoop_noInput
+
+	;mov ax, word [kb_buffer + 16]
+	;cmp ax, 1
+	;jne _mainLoop_noInput
+	;call _processInput
+_mainLoop_noInput:
+	;call _updateTheta
+	call _updateBallPos	
+	;call _computePaddleCenter
+
+	; Get end time
+    ;mov rax, 228         ; syscall: clock_gettime
+    ;xor rdi, rdi         ; CLOCK_REALTIME
+    ;lea rsi, [end_time]
+    ;syscall
+
+    ; Calculate elapsed time (end_time - start_time)
+    ;mov rax, [end_time]
+    ;sub rax, [start_time]
+    ;mov rbx, [end_time + 8]
+    ;sbb rbx, [start_time + 8]
+    ;mov [timespec], rax
+    ;mov [timespec + 8], rbx
+
+    ; Calculate remaining time to sleep (frame_duration - elapsed_time)
+    ;mov rax, 0
+    ;sub rax, qword [timespec]
+    ;mov rdx, qword [frame_duration]
+    ;sbb rdx, qword [timespec + 8]
+
+	;cmp rdx, 0
+	;jl _mainLoop
+
+    ; Sleep for remaining time
+    ;lea rdi, [timespec]
+    ;mov [timespec], rax
+    ;mov [timespec + 8], rdx
+
+    ;mov rax, 35          ; syscall: nanosleep
+    ;syscall
+
+	jmp _mainLoop
+
+; Checks for input, using non-blocking syscall.
+;
+; @return - rax - number of bytes read.
+_checkForInput:
+	push rax
+	push rdi
+	push rsi
+
+	; Step 1: Get current flags
+    mov eax, SYS_FCNTL  
+    mov edi, dword [kb_fd]          
+    mov esi, F_GETFL ; F_GETFL
+    syscall
+
+	; Step 2: Set O_NONBLOCK flag
+    or eax, 0x800       ; O_NONBLOCK is 0x800
+    mov edi, dword [kb_fd]
+    mov esi, F_SETFL          
+    mov edx, eax        ; new flags
+    mov eax, SYS_FCNTL         
+    syscall
+
+	; Step 3: Read input event.
 	mov rax, SYS_READ
-	mov rdi, [kb_fd]
+	mov edi, dword [kb_fd]
 	mov rsi, kb_buffer
 	mov rdx, 24 ; Number of bytes to read (input event size).
 	syscall
 
-	cmp rax, 24	
-	jne _mainLoop_noInput
-	mov ax, [kb_buffer + 16]
-	cmp ax, 1
-	jne _mainLoop_noInput
-	call _processInput
-_mainLoop_noInput:
-	call _updateTheta
-	call _computePaddleCenter
-	jmp _mainLoop
+	pop rsi
+	pop rdi
+	pop rax
+	ret
+
+_processInput:	
+	push rax
+
+	mov eax, dword [kb_buffer + 20] ; Value (offset 20 in input_event structure).
+	cmp eax, 0 ; Key release.
+	je _processInput_release
+	cmp eax, 1 ; Key press.
+	je _processInput_press
+	jmp _processInput_end
+_processInput_release:
+	mov dword [move_state], 0
+	jmp _processInput_end
+_processInput_press:	
+	mov ax, word [kb_buffer + 18] ; Keycode (offset 18 in input_event structure).
+	cmp ax, KEY_CODE_LEFT_ARROW
+	je _processInput_moveAntiClockwise	
+	cmp ax, KEY_CODE_RIGHT_ARROW
+	je _processInput_moveClockwise
+	cmp ax, KEY_CODE_Q
+	je _processInput_quit
+	jmp _processInput_end
+_processInput_moveAntiClockwise:
+	mov dword [move_state], 1	
+	jmp _processInput_end
+_processInput_moveClockwise:
+	mov dword [move_state], 2 
+	jmp _processInput_end
+_processInput_end:
+	pop rax
+	ret
+_processInput_quit:	
+	call _exit
 
 _updateTheta:	
-	mov eax, [move_state]	
+	push rax
+	push rbp
+	mov rbp, rsp
+
+	sub rsp, 16
+
+	movss dword [rsp + 0], xmm0
+	movss dword [rsp + 4], xmm1
+	movss dword [rsp + 8], xmm2
+
+	mov eax, dword [move_state]	
 	cmp eax, 2 ; Clockwise.
 	je _updateTheta_inc
 	cmp eax, 1 ; Anti-clockwise.
 	je _updateTheta_dec
-	ret
+	jmp _updateTheta_end
 _updateTheta_inc:
-	movss xmm0, [theta]
-	movss xmm1, [theta_offset]
+	movss xmm0, dword [theta]
+	movss xmm1, dword [theta_offset]
 	addss xmm0, xmm1 ; Move theta. 	
 	movss dword [theta], xmm0
 	
 	; Now do range check. If over 2pi, subtract 2pi.
 	mov eax, 2
 	cvtsi2ss xmm1, eax
-	movss xmm2, [pi]
+	movss xmm2, dword [pi]
 	mulss xmm2, xmm1 ; 2pi
 	ucomiss xmm0, xmm2
 	jb _updateTheta_end ; If within 2pi, we are fine.
 	subss xmm0, xmm2 ; Subtract 2pi.
 	movss dword [theta], xmm0
-	ret
+	jmp _updateTheta_end
 _updateTheta_dec:
-	movss xmm0, [theta]
-	movss xmm1, [theta_offset]
+	movss xmm0, dword [theta]
+	movss xmm1, dword [theta_offset]
 	subss xmm0, xmm1 ; Move theta. 	
 	movss dword [theta], xmm0
 	
@@ -159,102 +294,88 @@ _updateTheta_dec:
 	ja _updateTheta_end ; If greater than 0, we are fine. 
 	mov eax, 2
 	cvtsi2ss xmm1, eax
-	movss xmm2, [pi]
+	movss xmm2, dword [pi]
 	mulss xmm2, xmm1 ; 2pi
 	addss xmm0, xmm2 ; Add 2pi.
 	movss dword [theta], xmm0
-	ret
+	jmp _updateTheta_end
 _updateTheta_end:
+
+	movss xmm0, dword [rsp + 0]
+	movss xmm1, dword [rsp + 4]
+	movss xmm2, dword [rsp + 8]
+
+	add rsp, 16
+
+	pop rbp
+	pop rax
 	ret	
 
-_processInput:	
-	mov eax, [kb_buffer + 20] ; Value (offset 20 in input_event structure).
-	cmp eax, 0 ; Key release.
-	je _processInput_release
-	cmp eax, 1 ; Key press.
-	jge _processInput_press
-	ret
-_processInput_release:
-	mov dword [move_state], 0
-	ret
-_processInput_press:	
-	mov ax, [kb_buffer + 18] ; Keycode (offset 18 in input_event structure).
-	cmp ax, KEY_CODE_LEFT_ARROW
-	je _processInput_moveAntiClockwise	
-	cmp ax, KEY_CODE_RIGHT_ARROW
-	je _processInput_moveClockwise
-	cmp ax, KEY_CODE_Q
-	je _processInput_quit
-	ret
-_processInput_moveAntiClockwise:
-	mov dword [move_state], 1	
-	ret
-_processInput_moveClockwise:
-	mov dword [move_state], 2 
-	ret
-_processInput_quit:
-	; Close framebuffer device.
-    mov rax, SYS_CLOSE              
-    mov rdi, [fb_fd]        
-    syscall                 
-
-	; Close keyboard device.
-	mov rax, SYS_CLOSE
-	mov rdi, [kb_fd]
-	syscall
-
-	call _exit
-
-; Sets entire framebuffer to one colour.
-_clearScreen:
-	push rax
-	push rdx
-	
-	mov rax, 0
-	mov edx, [bg_col]
-_clearScreenLoop:
-	mov dword [staging_buffer + rax], edx ; rax is the offset.
-	add rax, 4
-	cmp rax, FB_SIZE
-	jne _clearScreenLoop
-
-	pop rdx
-	pop rax
-	ret
-
-_drawCircle:	
-	push rax
-	push rcx
+_updateBallPos:
 	push rbp
 	mov rbp, rsp
 
+	sub rsp, 16
+
+	movss dword [rsp + 0], xmm0
+
+	; Update x.
+	movss xmm0, dword [ball_pos_x]
+	movss xmm1, dword [ball_vel_x]
+	addss xmm0, xmm1
+	movss dword [ball_pos_x], xmm0
+	
+	; Update y.
+	movss xmm0, dword [ball_pos_y]
+	movss xmm1, dword [ball_vel_y]
+	addss xmm0, xmm1
+	movss dword dword [ball_pos_y], xmm0
+
+	movss dword [rsp + 0], xmm0
+
+	add rsp, 16
+
+	pop rbp
+	ret	
+
+_render:	
+	push rax
+	push rbx
+	push rcx
+
 	mov rbx, 0 ; Framebuffer offset.
-_drawCircleLoop:		
-	; Find distance from screen center.
+_render_loop:		
+	call _distBetweenPointAndBall2 ; Result in eax.
+	mov ecx, dword [ball_radius]
+	imul ecx, ecx ; Square radius.
+	cmp eax, ecx
+	jle _render_loop_ball
 	call _distBetweenPointAndCenter2 ; Result in eax.
-	mov ecx, [boundary_radius]
+	mov ecx, dword [boundary_radius]
 	imul ecx, ecx ; Square radius.
 	sub eax, ecx
 	cmp eax, 0 ; Make sure computed distance is positive.
-	jge _positive
+	jge _render_loop_positive
 	neg eax
-_positive:
+_render_loop_positive:
 	; Set correct color of pixel.
 	mov dword [staging_buffer + rbx], 0xFF0000 ; Red.
-	mov ecx, [boundary_thickness]
+	mov ecx, dword [boundary_thickness]
 	imul ecx, ecx ; Square thickness.
 	cmp eax, ecx
-	jg _nextPixel
+	jg _render_loop_nextPixel
 	mov dword [staging_buffer + rbx], 0x000000 ; Black.	
 
 	; Check if part of the paddle.	
-	; WARNING: Will probably render multiple paddles due to periodicity of cos and squaring.
 	call _cosineOffset ; Result in xmm0.
-	movss xmm1, [cos_pi_over_12]
+	movss xmm1, dword [cos_pi_over_12]
 	ucomiss xmm0, xmm1
-	jb _nextPixel ; Jump less than.
+	jb _render_loop_nextPixel ; Jump less than.
 	mov dword [staging_buffer + rbx], 0xFFFFFF ; White.	
-_nextPixel:
+	jmp _render_loop_nextPixel
+_render_loop_ball:
+	mov dword [staging_buffer + rbx], 0xFFFFFF ; White.
+_render_loop_nextPixel:
 	; Move to next pixel.
 	add rbx, 4
 
@@ -268,10 +389,10 @@ _nextPixel:
 	mov dword [x], edx ; Remainder.
 
 	cmp rbx, FB_SIZE
-	jne _drawCircleLoop 	
+	jne _render_loop 	
 	
-	pop rbp
 	pop rcx
+	pop rbx
 	pop rax
 
 	ret
@@ -292,7 +413,7 @@ _sine:
 
 	mov ebx, 1 ; Final multiplier, used if theta greater than pi.
 
-	movss xmm1, [pi]
+	movss xmm1, dword [pi]
 	ucomiss xmm0, xmm1 ; Check if greater than pi.
 	jb _sine_withinPi
 	subss xmm0, xmm1
@@ -303,7 +424,7 @@ _sine_withinPi:
 	divss xmm1, xmm2 ; pi/2.
 	ucomiss xmm0, xmm1
 	jb _sine_inRange	; If greater than pi/2, then do pi - theta.
-	movss xmm1, [pi]
+	movss xmm1, dword [pi]
 	subss xmm1, xmm0
 	movss xmm0, xmm1
 _sine_inRange:
@@ -338,10 +459,10 @@ _sine_inRange:
 	cvtsi2ss xmm4, ebx
 	mulss xmm0, xmm4
 
-	movss xmm1, [rsp + 0]
-	movss xmm2, [rsp + 4]
-	movss xmm3, [rsp + 8]
-	movss xmm4, [rsp + 12]
+	movss xmm1, dword [rsp + 0]
+	movss xmm2, dword [rsp + 4]
+	movss xmm3, dword [rsp + 8]
+	movss xmm4, dword [rsp + 12]
 	add rsp, 16
 	pop rbx
 	pop rax
@@ -366,7 +487,7 @@ _cosine:
 	mov ebx, 1
 	
 	; Range manipulation magic.
-	movss xmm1, [pi]
+	movss xmm1, dword [pi]
 	mov eax, 2
 	cvtsi2ss xmm2, eax
 	divss xmm1, xmm2 ; pi/2.
@@ -382,7 +503,7 @@ _cosine:
 	ucomiss xmm0, xmm1
 	jb _cosine_within3piover2
 	; At this point, it is greater than 3pi/2.
-	movss xmm1, [pi]
+	movss xmm1, dword [pi]
 	mov eax, 2
 	cvtsi2ss xmm2, eax
 	mulss xmm1, xmm2 ; 2pi.
@@ -394,7 +515,7 @@ _cosine_withinPi:
 	subss xmm1, xmm0 ; pi/2 - theta.
 	mov ebx, -1
 _cosine_within3piover2:
-	movss xmm1, [pi]
+	movss xmm1, dword [pi]
 	subss xmm0, xmm1
 	mov ebx, -1
 	jmp _cosine_inRange		
@@ -429,10 +550,10 @@ _cosine_inRange:
 	cvtsi2ss xmm4, ebx
 	mulss xmm0, xmm4
 
-	movss xmm1, [rsp + 0]
-	movss xmm2, [rsp + 4]
-	movss xmm3, [rsp + 8]
-	movss xmm4, [rsp + 12]
+	movss xmm1, dword [rsp + 0]
+	movss xmm2, dword [rsp + 4]
+	movss xmm3, dword [rsp + 8]
+	movss xmm4, dword [rsp + 12]
 	add rsp, 16
 	pop rbx
 	pop rax
@@ -443,25 +564,25 @@ _cosine_inRange:
 ;
 ; @return eax - distance.
 _dist2:
-	; Must move rsp since the function call itself pushes the return address onto the stack.
+	; Must move rsp since the function call itself pushes the return address onto the stack, along with the prolog.
 	add rsp, 8
 
 	; Find deltas.
-	mov eax, [rsp + 8]
-	sub dword [rsp + 0], eax
-	mov eax, [rsp + 12]
+	mov eax, dword [rsp + 8]
+	sub dword dword [rsp + 0], eax
+	mov eax, dword [rsp + 12]
 	sub dword [rsp + 4], eax 
 
 	; Square delatas.
-	mov eax, [rsp + 0]
+	mov eax, dword [rsp + 0]
 	imul eax, eax
 	mov dword [rsp + 0], eax
 	mov eax, [rsp + 4]
 	imul eax, eax
 	mov dword [rsp + 4], eax
 
-	mov eax, [rsp + 0]
-	add eax, [rsp + 4]
+	mov eax, dword [rsp + 0]
+	add eax, dword [rsp + 4]
 
 	sub rsp, 8
 
@@ -492,6 +613,38 @@ _distBetweenPointAndCenter2:
 	pop rbp
 	ret
 
+; Finds the distance squared between (x,y) and (ball_pos_x, ball_pos_y).
+;
+; @return eax - distance.
+_distBetweenPointAndBall2:
+	push rbp
+	mov rbp, rsp
+
+	movss dword [rsp + 16], xmm0
+
+	sub rsp, 32
+
+	mov eax, dword [x]
+	mov dword [rsp + 0], eax 
+	mov eax, dword [y]
+	mov dword [rsp + 4], eax
+	movss xmm0, dword [ball_pos_x]
+	cvttss2si eax, xmm0 ; Convert float to int with truncation.
+	mov dword [rsp + 8], eax
+	movss xmm0, dword [ball_pos_y]
+	cvttss2si eax, xmm0
+	mov dword [rsp + 12], eax
+
+	call _dist2
+
+	movss xmm0, dword [rsp + 16]
+
+	add rsp, 32
+
+	pop rbp
+	ret
+
+
 ; Determines cos of the angle between (x,y), (screen_center_x, screen_center_y) and (paddle_center_x, paddle_center_y), at the center. Uses the dot prod formula.
 ;
 ; @return - result in xmm0.
@@ -512,42 +665,42 @@ _cosineOffset:
 	movss dword [rsp + 16], xmm0
 
 	; Find dist between paddle and screen center.
-	mov eax, [paddle_center_x] 
+	mov eax, dword [paddle_center_x] 
 	mov dword [rsp + 0], eax 	
-	mov eax, [paddle_center_y]
+	mov eax, dword [paddle_center_y]
 	mov dword [rsp + 4], eax
-	mov eax, [screen_center_x]
+	mov eax, dword [screen_center_x]
 	mov dword [rsp + 8], eax
-	mov eax, [screen_center_y]
+	mov eax, dword [screen_center_y]
 	mov dword [rsp + 12], eax
 	call _dist2
 	cvtsi2ss xmm0, rax   
 	call _sqrt
-	mulss xmm0, [rsp + 16]
+	mulss xmm0, dword [rsp + 16]
 	movss dword [rsp + 16], xmm0
 
 	; Find dotprod of length between center and point with length between center and paddle.
 	; Multiply x-components.
-	mov eax, [x]
-	sub eax, [screen_center_x]
+	mov eax, dword [x]
+	sub eax, dword [screen_center_x]
 	mov dword [rsp + 20], eax
-	mov eax, [paddle_center_x]
-	sub eax, [screen_center_x]
-	imul eax, [rsp + 20]
+	mov eax, dword [paddle_center_x]
+	sub eax, dword [screen_center_x]
+	imul eax, dword [rsp + 20]
 	; Multiply y-components.
-	mov ebx, [y]
-	sub ebx, [screen_center_y]
+	mov ebx, dword [y]
+	sub ebx, dword [screen_center_y]
 	mov dword [rsp + 20], ebx
-	mov ebx, [paddle_center_y]
-	sub ebx, [screen_center_y]
-	imul ebx, [rsp + 20]
+	mov ebx, dword [paddle_center_y]
+	sub ebx, dword [screen_center_y]
+	imul ebx, dword [rsp + 20]
 	; Add components together.
 	add eax, ebx	
 	mov dword [rsp + 20], eax
 
 	; Put it all together.
-	cvtsi2ss xmm0, [rsp + 20]
-	divss xmm0, [rsp + 16]	
+	cvtsi2ss xmm0, dword [rsp + 20]
+	divss xmm0, dword [rsp + 16]	
 		
 	add rsp, 32
 
@@ -582,23 +735,40 @@ _sqrtLoop:
 	cmp rax, 10	
 	jl _sqrtLoop
 	
-	movss xmm1, [rsp + 0]
-	movss xmm2, [rsp + 4]
+	movss xmm1, dword [rsp + 0]
+	movss xmm2, dword [rsp + 4]
 	add rsp, 16
 	pop rbx
 	pop rax
+	ret
 
 _computeScreenCenter:
 	push rax
+	push rbp
+	mov rbp, rsp
+	
+	sub rsp, 16
+	
+	movss dword [rsp + 0], xmm0
 
 	mov rax, SCREEN_X
 	shr rax, 1
 	mov dword [screen_center_x], eax
+	cvtsi2ss xmm0, eax
+	movss dword [ball_pos_x], xmm0 
 	mov rax, SCREEN_Y
 	shr rax, 1
 	mov dword [screen_center_y], eax
+	cvtsi2ss xmm0, eax
+	movss dword [ball_pos_y], xmm0
 
+	movss xmm0, dword [rsp + 0] 
+
+	add rsp, 16
+
+	pop rbp
 	pop rax
+	ret
 
 ; Calculates (paddle_center_x, paddle_center_y) based on (x,y), theta and boundary_radius.
 ; Note: this rounds position to an integer.
@@ -609,40 +779,39 @@ _computePaddleCenter:
 	movss dword [rsp + 4], xmm1
 	movss dword [rsp + 8], xmm2
 
-	cvtsi2ss xmm0, [boundary_radius] ; paddle x.
-	cvtsi2ss xmm1, [boundary_radius] ; paddle y.	
+	cvtsi2ss xmm0, dword [boundary_radius] ; paddle x.
+	cvtsi2ss xmm1, dword [boundary_radius] ; paddle y.	
 
 	; Calc sin(theta)
 	movss dword [rsp + 12], xmm0 ; Stash xmm0.
-	movss xmm0, [theta]
+	movss xmm0, dword [theta]
 	call _sine ; Result in xmm0.
 	movss xmm2, xmm0
-_break:
-	movss xmm0, [rsp + 12]
+	movss xmm0, dword [rsp + 12]
 	
 	; Find paddle_center_x
 	mulss xmm0, xmm2 ; rcos(theta).
-	cvtsi2ss xmm2, [screen_center_x]
+	cvtsi2ss xmm2, dword [screen_center_x]
 	addss xmm0, xmm2 ; Offset.
 	cvttss2si rax, xmm0
 	mov dword [paddle_center_x], eax
 
 
 	; Store cos(theta) in xmm2.
-	movss xmm0, [theta]
+	movss xmm0, dword [theta]
 	call _cosine ; Result in xmm0.
 	movss xmm2, xmm0
 
 	; Find paddle_center_y
 	mulss xmm1, xmm2 ; rsin(theta).
-	cvtsi2ss xmm2, [screen_center_y]
+	cvtsi2ss xmm2, dword [screen_center_y]
 	subss xmm2, xmm1 ; Offset.
 	cvttss2si rax, xmm2
 	mov dword [paddle_center_y], eax
 
-	movss xmm0, [rsp + 0]
-	movss xmm1, [rsp + 4]
-	movss xmm2, [rsp + 8]
+	movss xmm0, dword [rsp + 0]
+	movss xmm1, dword [rsp + 4]
+	movss xmm2, dword [rsp + 8]
 	add rsp, 16
 	pop rax
 	ret
@@ -650,21 +819,62 @@ _break:
 _flushScreenBuffer:
 	; Seek to the beginning of the framebuffer.
     mov rax, SYS_LSEEK              
-    mov rdi, [fb_fd]        
+    mov edi, dword [fb_fd]        
     xor rsi, rsi            ; Offset (beginning of file).
     xor rdx, rdx            ; Whence (SEEK_SET).
     syscall                 
 
 	; Flush.
 	mov rax, SYS_WRITE              
-    mov rdi, [fb_fd]        
+    mov edi, dword [fb_fd]        
     mov rsi, staging_buffer         
     mov rdx, FB_SIZE        
     syscall                 
 
 	ret
 
+_render2:
+	; Fill framebuffer with white color
+    mov rdi, qword [fb_ptr]
+    mov rcx, FB_SIZE  ; screensize
+    xor rax, rax  ; Clear RAX for memset
+    mov al, 0x00  ; White color (assuming little-endian)
+
+    cld  ; Clear direction flag for stosb
+    rep stosb
+
+	movss xmm0, dword [ball_pos_y]
+	cvttss2si ebx, xmm0 ; Convert float to int with truncation.
+	imul ebx, SCREEN_X
+	imul ebx, 4
+	movss xmm0, dword [ball_pos_x]
+	cvttss2si eax, xmm0 ; Convert float to int with truncation.
+	imul eax, 4
+	add ebx, eax 
+		
+	mov rax, qword [fb_ptr]
+	add rax, rbx
+	mov dword [rax], 0xffffffff
+
+	ret
+
 _exit:
+	; Close framebuffer device.
+    mov rax, SYS_CLOSE              
+    mov edi, dword [fb_fd]        
+    syscall                 
+
+	; Close keyboard device.
+	mov rax, SYS_CLOSE
+	mov edi, dword [kb_fd]
+	syscall
+
+	; Unmap framebuffer memory
+    ;mov rdi, qword [fb_ptr]
+    ;mov rsi, FB_SIZE  ; screensize
+    ;mov rax, 11 ; SYS_munmap
+    ;syscall
+
 	mov rax, SYS_EXIT
 	xor rdi, rdi
 	syscall
