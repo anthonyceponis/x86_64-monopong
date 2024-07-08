@@ -1,9 +1,4 @@
-; Global vars.
-; Use the following command to determine the correct dimensions: cat /sys/class/graphics/fb0/virtual_size.
-SCREEN_X equ 1920
-SCREEN_Y equ 1200
-COLOUR_DEPTH equ 4 ; In bytes.
-FB_SIZE equ SCREEN_X * SCREEN_Y * COLOUR_DEPTH ; In bytes.
+%include "config.asm"
 
 ; Syscall macros.
 SYS_EXIT equ 60
