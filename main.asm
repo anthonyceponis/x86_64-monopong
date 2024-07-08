@@ -1,38 +1,33 @@
 ; Global vars.
-; Use the following command to determine the correct dimensions.
-; cat /sys/class/graphics/fb0/virtual_size
-%define SCREEN_X 1920
-%define SCREEN_Y 1200
-%define COLOUR_DEPTH 4 ; In bytes.
-%define FB_SIZE SCREEN_X * SCREEN_Y * COLOUR_DEPTH ; In bytes.
+; Use the following command to determine the correct dimensions: cat /sys/class/graphics/fb0/virtual_size.
+SCREEN_X equ 1920
+SCREEN_Y equ 1200
+COLOUR_DEPTH equ 4 ; In bytes.
+FB_SIZE equ SCREEN_X * SCREEN_Y * COLOUR_DEPTH ; In bytes.
 
 ; Syscall macros.
-%define SYS_EXIT 60
-%define SYS_READ 0
-%define SYS_WRITE 1
-%define SYS_OPEN 2
-%define SYS_LSEEK 8
-%define SYS_CLOSE 3
-%define SYS_FCNTL 72
-%define SYS_GETTIMEOFDAY 96
+SYS_EXIT equ 60
+SYS_READ equ 0
+SYS_WRITE equ 1
+SYS_OPEN equ 2
+SYS_LSEEK equ 8
+SYS_CLOSE equ 3
+SYS_FCNTL equ 72
+SYS_GETTIMEOFDAY equ 96
 
-%define F_GETFL 3
-%define F_SETFL 4
+F_GETFL equ 3
+F_SETFL equ 4
 
 ; Misc.
-%define O_RDONLY 0
-%define O_WRONLY 1
-%define O_RDWR 2
-%define O_NONBLOCK 0x800
+O_RDONLY equ 0
+O_WRONLY equ 1
+O_RDWR equ 2
+O_NONBLOCK equ 0x800
 
 ; Keycodes (case insensitive)
-%define KEY_CODE_Q 16
-%define KEY_CODE_LEFT_ARROW 105
-%define KEY_CODE_RIGHT_ARROW 106
-
-%define KDSETMODE 0x4B3A
-
-%define DT 8333 ; 120 fps in microseconds.
+KEY_CODE_Q equ 16
+KEY_CODE_LEFT_ARROW equ 105
+KEY_CODE_RIGHT_ARROW equ 106
 
 section .data
     fb_device db "/dev/fb0", 0
@@ -45,6 +40,7 @@ section .data
     tiny dd 0x30000000 ; (0.5)^31 
     rand_offset_lower dd 0.025 ; The offset for when a collision happens. 
     rand_offset_upper dd 0.070
+    rand_offset_sign dd 1.0
 
 	screen_center_x dd 0
 	screen_center_y dd 0
@@ -57,7 +53,7 @@ section .data
 	ball_pos_x dd 0.0
 	ball_pos_y dd 0.0
 	ball_vel_x dd 0.0
-	ball_vel_y dd -1.75 ; For some reason, the speed increases alot on -0.5 and -1.0 (special values?)
+	ball_vel_y dd -2.5 
 	ball_radius dd 10
     ball_colour dd 0xffffff
 
@@ -65,13 +61,14 @@ section .data
     
     ; Common decimals for convinience.
     zero dd 0.0
+    one dd 1.0
     minus_one dd -1.0
 
 	boundary_radius dd 250
 	boundary_thickness dd 3
-    boundary_colour dd 0x000000
+    boundary_colour dd 0x000000 ; Black
 
-    theta dd 0.0
+    theta dd 0.0 ; Angle of paddle rotation.
 	theta_offset dd 0.02 ; Baisically controls speed at which paddle turns.
 	pi dd 3.14159265
 	cos_pi_over_12 dd 0.9659258 ; cos(pi/12) roughly. Used to determine the width of the paddle.
@@ -82,33 +79,20 @@ section .data
     key_left_arrow_active dd 0
     key_right_arrow_active dd 0 
     
+    delta_t dd 8333 ; 120 fps in microseconds. 
+    
 section .bss
     fb_fd resd 1
 	kb_fd resd 1
-	staging_buffer resb FB_SIZE
+	staging_buffer resb FB_SIZE ; Stores the framebuffer contents.
 	kb_buffer resb 24 ; Buffer to hold integer string representation.
-    time_interval_start resq 2 ; First 64 bits store time in microseconds.
+    time_interval_start resq 2 ; First 64 bits store time in microseconds. Require 2 x 64 bits to store the syscall response.
     time_interval_end resq 2 ; First 64 bits store time in microseconds.
 
 section .text
     global _start
 
 _start:
-	; Testing area.
-	;mov ebx, 6
-	;cvtsi2ss xmm1, ebx
-	;movss xmm0, dword [rand_offset_lower]   
-    ;movss xmm1, dword [rand_offset_upper]
-    ;call _randFloat 
-    ;movss xmm0, dword [rand_offset_lower]
-    ;movss xmm1, dword [rand_offset_upper]
-    ;call _randRotMat
-;_finish:
-	;mov rax, SYS_EXIT
-	;xor rdi, rdi
-	;syscall	
-
-    
     ; Open framebuffer device.
     mov rax, SYS_OPEN              
     mov rdi, fb_device      
@@ -137,7 +121,7 @@ _mainLoop:
     call _getTime
     mov rax, qword [time_interval_end]
     sub rax, qword [time_interval_start]
-    cmp eax, DT
+    cmp eax, dword [delta_t]
     jl _mainLoop
     mov rax, qword [time_interval_end]
     mov qword [time_interval_start], rax
@@ -296,6 +280,7 @@ _updateBallPos:
 	sub rsp, 16
 
 	movss dword [rsp + 0], xmm0
+	movss dword [rsp + 44], xmm1
 
 	; Update x.
 	movss xmm0, dword [ball_pos_x]
@@ -312,94 +297,12 @@ _updateBallPos:
 _updateBallPos_end:
 
 	movss dword [rsp + 0], xmm0
+	movss dword [rsp + 4], xmm1
 
 	add rsp, 16
 
 	pop rbp
-	ret	
-
-; @param - xmm0 - angle.
-;
-; @return - xmm0 - cos(angle).
-_cosine_bhaskara:
-    mulss xmm0, xmm0 ; angle^2
-    
-
-    movss xmm1, dword [pi]
-    mulss xmm1, xmm1 ; pi^2
-
-    movss xmm2, xmm0
-    addss xmm2, xmm1 ; pi^2 + angle^2
-
-    addss xmm0, xmm0 ; 2pi^2
-    addss xmm0, xmm0 ; 4pi^2
-    subss xmm1, xmm0
-
-    divss xmm1, xmm2
-    movss xmm0, xmm1
-    
-    ret 
-    
-
-_render:	
-	push rax
-	push rbx
-	push rcx
-
-	mov rbx, 0 ; Framebuffer offset.
-_render_loop:		
-	call _distBetweenPointAndBall2 ; Result in eax.
-	mov ecx, dword [ball_radius]
-	imul ecx, ecx ; Square radius.
-	cmp eax, ecx
-	jle _render_loop_ball
-    jmp _render_loop_nextPixel
-	call _distBetweenPointAndCenter2 ; Result in eax.
-	mov ecx, dword [boundary_radius]
-	imul ecx, ecx ; Square radius.
-	sub eax, ecx
-	cmp eax, 0 ; Make sure computed distance is positive.
-	jge _render_loop_positive
-	neg eax
-_render_loop_positive:
-	; Set correct color of pixel.
-	mov dword [staging_buffer + rbx], 0xFF0000 ; Red.
-	mov ecx, dword [boundary_thickness]
-	imul ecx, ecx ; Square thickness.
-	cmp eax, ecx
-	jg _render_loop_nextPixel
-	mov dword [staging_buffer + rbx], 0x000000 ; Black.	
-
-	; Check if part of the paddle.	
-	call _cosineOffset ; Result in xmm0.
-	movss xmm1, dword [cos_pi_over_12]
-	ucomiss xmm0, xmm1
-	jb _render_loop_nextPixel ; Jump less than.
-	mov dword [staging_buffer + rbx], 0xFFFFFF ; White.	
-	jmp _render_loop_nextPixel
-_render_loop_ball:
-	mov dword [staging_buffer + rbx], 0xFFFFFF ; White.
-_render_loop_nextPixel:
-	; Move to next pixel.
-	add rbx, 4
-
-	; Determine next x and y coords.
-	mov rax, rbx
-	shr rax, 2 ; Divide by 4 since pixel moves in bytes of 4.
-	mov rdx, 0 ; Clear rdx for unsigned division.
-	mov rcx, SCREEN_X
-	idiv rcx
-	mov dword [y], eax ; Quotient.
-	mov dword [x], edx ; Remainder.
-
-	cmp rbx, FB_SIZE
-	jne _render_loop 	
-	
-	pop rcx
-	pop rbx
-	pop rax
-
-	ret
+	ret	    
 
 ; Approximates sine using taylor series with 3 terms.
 ; The approximation becomes shit after pi/2 so use symmetry.
@@ -1157,6 +1060,23 @@ _handleCollision_magPositive:
     movss dword [ball_pos_x], xmm4
     movss dword [ball_pos_y], xmm5 
 
+    ; Perform a cross product to determine the sign of the random angle. This gives player some control over direction.
+    mov eax, dword [paddle_center_x]
+    sub eax, dword [screen_center_x]
+    cvtsi2ss xmm4, eax
+    mov eax, dword [paddle_center_y]
+    sub eax, dword [screen_center_y]
+    cvtsi2ss xmm5, eax
+    mulss xmm4, xmm1
+    mulss xmm5, xmm0
+    subss xmm4, xmm5
+    movss xmm5, dword [one]
+    comiss xmm4, dword [zero]
+    ja _handleCollision_anglePositive
+    movss xmm5, dword [minus_one]
+_handleCollision_anglePositive:
+    movss dword [rand_offset_sign], xmm5    
+
     ; Scale dir of ball from center.
     mulss xmm0, xmm2
     mulss xmm1, xmm2
@@ -1179,8 +1099,6 @@ _handleCollision_magPositive:
     mulss xmm2, xmm4
     mulss xmm3, xmm5
     addss xmm2, xmm3 ; Reflected and randomised [ball_vel_y].
-
-    ; TODO: Also figure out why the speed sometimes increases in velocity.
 
     ; Save. 
     movss dword [ball_vel_x], xmm0
@@ -1206,6 +1124,8 @@ _handleCollision_end:
 _randRotMat:
     movss xmm0, dword [rand_offset_lower]
     movss xmm1, dword [rand_offset_upper]
+    mulss xmm0, dword [rand_offset_sign]
+    mulss xmm1, dword [rand_offset_sign]
     call _randFloat
     movss xmm3, xmm0 ; Stash random int in xmm3.
     call _sine
