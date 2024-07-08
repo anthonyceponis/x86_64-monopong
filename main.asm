@@ -14,6 +14,7 @@
 %define SYS_LSEEK 8
 %define SYS_CLOSE 3
 %define SYS_FCNTL 72
+%define SYS_GETTIMEOFDAY 96
 
 %define F_GETFL 3
 %define F_SETFL 4
@@ -22,57 +23,72 @@
 %define O_RDONLY 0
 %define O_WRONLY 1
 %define O_RDWR 2
+%define O_NONBLOCK 0x800
 
 ; Keycodes (case insensitive)
 %define KEY_CODE_Q 16
 %define KEY_CODE_LEFT_ARROW 105
 %define KEY_CODE_RIGHT_ARROW 106
 
+%define KDSETMODE 0x4B3A
+
+%define DT 8333 ; 120 fps in microseconds.
+
 section .data
     fb_device db "/dev/fb0", 0
 	kb_device db "/dev/input/event3", 0 ; 3 for inbuilt, 22 for wireless.
-
-	bg_col dd 0xFF0000 ; Red.
 
 	; Can be thought of as a cursor, refers to the pixel in the fb that is currently in focus.
 	x dd 0
 	y dd 0
 
-	;frame_duration  dq 16666667          ; 60 FPS = 16.666667 ms per frame
-	frame_duration  dq 33333333          ; 30 FPS = 333.33333 ms per frame
-    timespec        dq 0, 0
-    start_time      dq 0, 0
-    end_time        dq 0, 0
-
-	fb_ptr dq 0
+    tiny dd 0x30000000 ; (0.5)^31 
+    rand_offset_lower dd 0.025 ; The offset for when a collision happens. 
+    rand_offset_upper dd 0.070
 
 	screen_center_x dd 0
 	screen_center_y dd 0
+    
+    circle_center_x dd 0
+    circle_center_y dd 0
+    circle_radius dd 0
+    circle_colour dd 0x000000
 
 	ball_pos_x dd 0.0
 	ball_pos_y dd 0.0
 	ball_vel_x dd 0.0
-	ball_vel_y dd -0.5
+	ball_vel_y dd -1.75 ; For some reason, the speed increases alot on -0.5 and -1.0 (special values?)
 	ball_radius dd 10
+    ball_colour dd 0xffffff
+
+	bg_col dd 0xFF0000 ; Red.
+    
+    ; Common decimals for convinience.
+    zero dd 0.0
+    minus_one dd -1.0
 
 	boundary_radius dd 250
-	boundary_thickness dd 25
+	boundary_thickness dd 3
+    boundary_colour dd 0x000000
 
-	theta dd 0.0 ; Determines position of paddle relative to north, in radians. 
-	theta_offset dd 0.05 ; Baisically controls speed at which paddle turns.
+    theta dd 0.0
+	theta_offset dd 0.02 ; Baisically controls speed at which paddle turns.
 	pi dd 3.14159265
 	cos_pi_over_12 dd 0.9659258 ; cos(pi/12) roughly. Used to determine the width of the paddle.
 
 	paddle_center_x dd 0
 	paddle_center_y dd 0
 
-	move_state dd 0 ; 0 (still), 1 (anti-clockwise), 2 (clockwise).
-
+    key_left_arrow_active dd 0
+    key_right_arrow_active dd 0 
+    
 section .bss
     fb_fd resd 1
 	kb_fd resd 1
 	staging_buffer resb FB_SIZE
 	kb_buffer resb 24 ; Buffer to hold integer string representation.
+    time_interval_start resq 2 ; First 64 bits store time in microseconds.
+    time_interval_end resq 2 ; First 64 bits store time in microseconds.
 
 section .text
     global _start
@@ -81,17 +97,18 @@ _start:
 	; Testing area.
 	;mov ebx, 6
 	;cvtsi2ss xmm1, ebx
-	;movss xmm0, [theta]   
-	;divss xmm0, xmm1
-	;mov ebx, 11
-	;cvtsi2ss xmm1, ebx
-	;mulss xmm0, xmm1
-	;call _cosine
+	;movss xmm0, dword [rand_offset_lower]   
+    ;movss xmm1, dword [rand_offset_upper]
+    ;call _randFloat 
+    ;movss xmm0, dword [rand_offset_lower]
+    ;movss xmm1, dword [rand_offset_upper]
+    ;call _randRotMat
 ;_finish:
 	;mov rax, SYS_EXIT
 	;xor rdi, rdi
 	;syscall	
 
+    
     ; Open framebuffer device.
     mov rax, SYS_OPEN              
     mov rdi, fb_device      
@@ -103,146 +120,106 @@ _start:
 	; Open keyboard device.
 	mov rax, SYS_OPEN
 	mov rdi, kb_device
-	mov rsi, O_RDONLY
-	xor rdx, rdx ; Mode (not used).
+	mov rsi, O_RDONLY | O_NONBLOCK
 	syscall
-	mov dword [kb_fd], eax ; Store file descriptor.
+	mov dword [kb_fd], eax ; Store file descriptor. 
 
-	; Map framebuffer to memory
-    ;mov rdi, 0
-    ;mov rsi, FB_SIZE  ; screensize
-    ;mov rdx, 3 ;  PROT_READ | PROT_WRITE
-    ;mov r10, 1, ; MAP_SHARED
-    ;mov r8, qword [fb_fd]
-    ;mov r9, 0
-    ;mov rax, 9 ; mmap syscall.
-    ;syscall
-    ;mov qword [fb_ptr], rax  ; Save framebuffer pointer
-
-
+    ; Init time
+    call _getTime
+    mov rax, qword [time_interval_end]
+    mov qword [time_interval_start], rax
+    
 	call _computeScreenCenter
 	jmp _mainLoop   
     
 _mainLoop:
-	; Get start time
-    ;mov rax, 228         ; syscall: clock_gettime
-    ;xor rdi, rdi         ; CLOCK_REALTIME
-    ;lea rsi, [start_time]
-    ;syscall
+    ; Fixed time loop.
+    call _getTime
+    mov rax, qword [time_interval_end]
+    sub rax, qword [time_interval_start]
+    cmp eax, DT
+    jl _mainLoop
+    mov rax, qword [time_interval_end]
+    mov qword [time_interval_start], rax
 
 	; Update screen.
-	call _render
+    call _clearScreen
+    call _drawCircleBoundaryWithPaddle
+    call _drawBall 
 	call _flushScreenBuffer
-	;call _render2
 	
-	;call _checkForInput 
-	;cmp rax, 0	
-	;jle _mainLoop_noInput
-
-	;mov ax, word [kb_buffer + 16]
-	;cmp ax, 1
-	;jne _mainLoop_noInput
-	;call _processInput
-_mainLoop_noInput:
-	;call _updateTheta
-	call _updateBallPos	
-	;call _computePaddleCenter
-
-	; Get end time
-    ;mov rax, 228         ; syscall: clock_gettime
-    ;xor rdi, rdi         ; CLOCK_REALTIME
-    ;lea rsi, [end_time]
-    ;syscall
-
-    ; Calculate elapsed time (end_time - start_time)
-    ;mov rax, [end_time]
-    ;sub rax, [start_time]
-    ;mov rbx, [end_time + 8]
-    ;sbb rbx, [start_time + 8]
-    ;mov [timespec], rax
-    ;mov [timespec + 8], rbx
-
-    ; Calculate remaining time to sleep (frame_duration - elapsed_time)
-    ;mov rax, 0
-    ;sub rax, qword [timespec]
-    ;mov rdx, qword [frame_duration]
-    ;sbb rdx, qword [timespec + 8]
-
-	;cmp rdx, 0
-	;jl _mainLoop
-
-    ; Sleep for remaining time
-    ;lea rdi, [timespec]
-    ;mov [timespec], rax
-    ;mov [timespec + 8], rdx
-
-    ;mov rax, 35          ; syscall: nanosleep
-    ;syscall
-
-	jmp _mainLoop
-
-; Checks for input, using non-blocking syscall.
-;
-; @return - rax - number of bytes read.
-_checkForInput:
-	push rax
-	push rdi
-	push rsi
-
-	; Step 1: Get current flags
-    mov eax, SYS_FCNTL  
-    mov edi, dword [kb_fd]          
-    mov esi, F_GETFL ; F_GETFL
-    syscall
-
-	; Step 2: Set O_NONBLOCK flag
-    or eax, 0x800       ; O_NONBLOCK is 0x800
-    mov edi, dword [kb_fd]
-    mov esi, F_SETFL          
-    mov edx, eax        ; new flags
-    mov eax, SYS_FCNTL         
-    syscall
-
-	; Step 3: Read input event.
-	mov rax, SYS_READ
+    ; Read keyboard buffer.
+    mov rax, SYS_READ
 	mov edi, dword [kb_fd]
 	mov rsi, kb_buffer
 	mov rdx, 24 ; Number of bytes to read (input event size).
 	syscall
+	cmp rax, 24 ; Check if an event actually happened.	
+	jne _mainLoop_noInput
 
-	pop rsi
-	pop rdi
-	pop rax
-	ret
+	mov ax, word [kb_buffer + 16] ; Check for appropriate event type (1).
+	cmp ax, 1
+	jne _mainLoop_noInput
+	call _processInput
+_mainLoop_noInput:
+	call _updateTheta
+	call _updateBallPos	
+	call _computePaddleCenter	
+    call _handleCollision
+
+	jmp _mainLoop
+
+_getTime:
+    push rax
+    push rdi
+    push rsi
+    push rcx
+
+    mov rax, SYS_GETTIMEOFDAY
+    lea rdi, [time_interval_end]
+    xor rsi, rsi
+    syscall
+
+    ; Convert seconds and microseconds to a single value in microseconds.
+    mov rax, qword [time_interval_end] ; Seconds.
+    mov rcx, 1000000
+    imul rax, rcx ; Seconds * 1000000.
+    add rax, [time_interval_end + 8] ; Add microseconds.
+    mov qword [time_interval_end], rax 
+
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
+    ret
 
 _processInput:	
 	push rax
+    push rbx
 
 	mov eax, dword [kb_buffer + 20] ; Value (offset 20 in input_event structure).
 	cmp eax, 0 ; Key release.
-	je _processInput_release
+	je _processInput_update
 	cmp eax, 1 ; Key press.
-	je _processInput_press
+	je _processInput_update
 	jmp _processInput_end
-_processInput_release:
-	mov dword [move_state], 0
-	jmp _processInput_end
-_processInput_press:	
-	mov ax, word [kb_buffer + 18] ; Keycode (offset 18 in input_event structure).
-	cmp ax, KEY_CODE_LEFT_ARROW
-	je _processInput_moveAntiClockwise	
-	cmp ax, KEY_CODE_RIGHT_ARROW
-	je _processInput_moveClockwise
-	cmp ax, KEY_CODE_Q
-	je _processInput_quit
-	jmp _processInput_end
-_processInput_moveAntiClockwise:
-	mov dword [move_state], 1	
-	jmp _processInput_end
-_processInput_moveClockwise:
-	mov dword [move_state], 2 
-	jmp _processInput_end
+_processInput_update:
+	mov bx, word [kb_buffer + 18] ; Keycode (offset 18 in input_event structure).
+    cmp bx, KEY_CODE_LEFT_ARROW
+    je _processInput_leftArrow
+    cmp bx, KEY_CODE_RIGHT_ARROW
+    je _processInput_rightArrow
+    cmp bx, KEY_CODE_Q
+    je _processInput_quit
+    jmp _processInput_end
+_processInput_leftArrow:
+    mov dword [key_left_arrow_active], eax
+    jmp _processInput_end 
+_processInput_rightArrow:
+    mov dword [key_right_arrow_active], eax
+    jmp _processInput_end 
 _processInput_end:
+    pop rbx
 	pop rax
 	ret
 _processInput_quit:	
@@ -259,11 +236,12 @@ _updateTheta:
 	movss dword [rsp + 4], xmm1
 	movss dword [rsp + 8], xmm2
 
-	mov eax, dword [move_state]	
-	cmp eax, 2 ; Clockwise.
-	je _updateTheta_inc
+	mov eax, dword [key_left_arrow_active]	
 	cmp eax, 1 ; Anti-clockwise.
 	je _updateTheta_dec
+    mov eax, dword [key_right_arrow_active] 
+	cmp eax, 1 ; Clockwise.
+	je _updateTheta_inc
 	jmp _updateTheta_end
 _updateTheta_inc:
 	movss xmm0, dword [theta]
@@ -331,12 +309,37 @@ _updateBallPos:
 	addss xmm0, xmm1
 	movss dword dword [ball_pos_y], xmm0
 
+_updateBallPos_end:
+
 	movss dword [rsp + 0], xmm0
 
 	add rsp, 16
 
 	pop rbp
 	ret	
+
+; @param - xmm0 - angle.
+;
+; @return - xmm0 - cos(angle).
+_cosine_bhaskara:
+    mulss xmm0, xmm0 ; angle^2
+    
+
+    movss xmm1, dword [pi]
+    mulss xmm1, xmm1 ; pi^2
+
+    movss xmm2, xmm0
+    addss xmm2, xmm1 ; pi^2 + angle^2
+
+    addss xmm0, xmm0 ; 2pi^2
+    addss xmm0, xmm0 ; 4pi^2
+    subss xmm1, xmm0
+
+    divss xmm1, xmm2
+    movss xmm0, xmm1
+    
+    ret 
+    
 
 _render:	
 	push rax
@@ -350,6 +353,7 @@ _render_loop:
 	imul ecx, ecx ; Square radius.
 	cmp eax, ecx
 	jle _render_loop_ball
+    jmp _render_loop_nextPixel
 	call _distBetweenPointAndCenter2 ; Result in eax.
 	mov ecx, dword [boundary_radius]
 	imul ecx, ecx ; Square radius.
@@ -732,7 +736,7 @@ _sqrtLoop:
 	cvtsi2ss xmm2, ebx
 	divss xmm0, xmm2 ; Divide by 2.
 	
-	cmp rax, 10	
+	cmp rax, 10
 	jl _sqrtLoop
 	
 	movss xmm1, dword [rsp + 0]
@@ -831,32 +835,423 @@ _flushScreenBuffer:
     mov rdx, FB_SIZE        
     syscall                 
 
-	ret
+	ret    
 
-_render2:
-	; Fill framebuffer with white color
-    mov rdi, qword [fb_ptr]
-    mov rcx, FB_SIZE  ; screensize
-    xor rax, rax  ; Clear RAX for memset
-    mov al, 0x00  ; White color (assuming little-endian)
+; Draws a circle to the staging buffer.
+;
+; @param - [circle_center_x]
+; @param - [circle_center_y]
+; @param - [circle_radius]
+_drawCircle:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
 
-    cld  ; Clear direction flag for stosb
-    rep stosb
+	; Load parameters into registers
+    mov eax, dword [circle_center_x]           
+    mov ebx, dword [circle_center_y]            
+    mov ecx, dword [circle_radius]            
+    mov edx, dword [circle_colour]
 
-	movss xmm0, dword [ball_pos_y]
-	cvttss2si ebx, xmm0 ; Convert float to int with truncation.
-	imul ebx, SCREEN_X
-	imul ebx, 4
-	movss xmm0, dword [ball_pos_x]
-	cvttss2si eax, xmm0 ; Convert float to int with truncation.
-	imul eax, 4
-	add ebx, eax 
-		
-	mov rax, qword [fb_ptr]
-	add rax, rbx
-	mov dword [rax], 0xffffffff
+    ; Initialize circle drawing variables
+    mov r8, rcx
+    xor r9, r9               
+    mov r10, 1               
+    sub r10, rcx
+    
 
-	ret
+_drawCircle_loop:
+
+    ; Draw the 8 symmetric points
+    call _drawCircle_plotPoints
+
+    inc r9 
+    cmp r10, 0
+    jle _drawCircle_loop_decisionNegative 
+    
+    dec r8
+    sub r9, r8
+    shl r9, 1
+    add r10, r9
+    shr r9, 1
+    add r9, r8
+    add r10, 1 
+
+    jmp _drawCircle_nextPixel
+_drawCircle_loop_decisionNegative:
+    shl r9, 1
+    add r10, r9
+    shr r9, 1
+    add r10, 1
+_drawCircle_nextPixel:
+    ; Repeat until x > y 
+    cmp r8, r9
+    jge _drawCircle_loop
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    ret
+
+_drawCircle_plotPoints:
+    ; (cx + x, cy + y)
+    push rax
+    push rbx
+    add rax, r8
+    add rbx, r9
+    call _drawCircle_plotPixel
+    pop rbx
+    pop rax
+
+    ; (cx - x, cy + y)
+    push rax
+    push rbx
+    sub rax, r8
+    add rbx, r9
+    call _drawCircle_plotPixel
+    pop rbx
+    pop rax
+
+    ; (cx + x, cy - y)
+    push rax
+    push rbx
+    add rax, r8
+    sub rbx, r9
+    call _drawCircle_plotPixel
+    pop rbx
+    pop rax
+
+    ; (cx - x, cy - y)
+    push rax
+    push rbx
+    sub rax, r8
+    sub rbx, r9
+    call _drawCircle_plotPixel
+    pop rbx
+    pop rax
+
+    ; (cx + y, cy + x)
+    push rax
+    push rbx
+    add rax, r9
+    add rbx, r8
+    call _drawCircle_plotPixel
+    pop rbx
+    pop rax
+
+    ; (cx - y, cy + x)
+    push rax
+    push rbx
+    sub rax, r9
+    add rbx, r8
+    call _drawCircle_plotPixel
+    pop rbx
+    pop rax
+
+    ; (cx + y, cy - x)
+    push rax
+    push rbx
+    add rax, r9
+    sub rbx, r8
+    call _drawCircle_plotPixel
+    pop rbx
+    pop rax
+
+    ; (cx - y, cy - x)
+    push rax
+    push rbx
+    sub rax, r9
+    sub rbx, r8
+    call _drawCircle_plotPixel
+    pop rbx
+    pop rax
+
+    ret
+
+_drawCircle_plotPixel:
+    ; Calculate the framebuffer address for the pixel
+    ; Address = framebuffer + (y * screen_width + x) * 4
+    mov r11, SCREEN_X
+    imul r11, rbx
+    add r11, rax
+    shl r11, 2
+
+    mov dword [x], eax
+    mov dword [y], ebx    
+    call _cosineOffset ; Result in xmm0.
+	movss xmm1, dword [cos_pi_over_12]
+	ucomiss xmm0, xmm1
+	ja _drawCircle_plotPixel_skip ; Jump less than.
+
+    ; Store the color value at the calculated address
+    mov dword [staging_buffer + r11], edx
+    ret
+_drawCircle_plotPixel_skip:
+    mov dword [staging_buffer + r11], 0xffffff    
+    ret
+
+_clearScreen:
+    push rax
+    push rbx
+
+    mov eax, dword [bg_col]
+    mov rbx, 0
+_clearScreen_loop:
+    mov dword [staging_buffer + rbx], eax
+    add rbx, 4
+    cmp rbx, FB_SIZE
+    jne _clearScreen_loop
+
+    pop rbx
+    pop rax
+    ret
+
+_drawCircleBoundaryWithPaddle:
+    push rax
+    push rbx
+
+    mov ebx, 0
+_drawCircleBoundaryWithPaddle_loop:
+    mov eax, dword [screen_center_x]
+    mov dword [circle_center_x], eax
+    mov eax, dword [screen_center_y]
+    mov dword [circle_center_y], eax
+    mov eax, dword [boundary_radius]
+    add eax, ebx
+    mov dword [circle_radius], eax
+    mov eax, dword [boundary_colour]
+    mov dword [circle_colour], eax
+    call _drawCircle
+ 
+    inc ebx
+    cmp ebx, dword [boundary_thickness]
+    jl _drawCircleBoundaryWithPaddle_loop
+
+    pop rbx
+    pop rax
+    ret
+
+_drawBall:
+    push rax
+    push rbp
+    mov rbp, rsp
+
+    sub rsp, 16
+    movss dword [rsp + 0], xmm0
+
+    movss xmm0, dword [ball_pos_x]
+    cvttss2si eax, xmm0
+    mov dword [circle_center_x], eax
+    movss xmm0, dword [ball_pos_y]
+    cvttss2si eax, xmm0
+    mov dword [circle_center_y], eax
+    mov eax, dword [ball_radius]
+    mov dword [circle_radius], eax
+    mov eax, dword [ball_colour]
+    mov dword [circle_colour], eax 
+    call _drawCircle
+
+    movss xmm0, dword [rsp + 0]
+    add rsp, 16
+
+    pop rbp
+    pop rax
+    ret
+
+_handleCollision:
+    push rax
+    push rbp
+    mov rbp, rsp
+
+    sub rsp, 32
+    movss dword [rsp + 0], xmm0 ; Dir of ball from center {x}.
+    movss dword [rsp + 4], xmm1 ; Dir of ball from center {y}.
+    movss dword [rsp + 8], xmm2 ; Aux.
+    movss dword [rsp + 12], xmm3 ; Aux.
+    movss dword [rsp + 16], xmm4 ; Aux.
+    movss dword [rsp + 20], xmm5 ; Aux.
+
+    ; Calc dir of ball from center.
+    movss xmm0, dword [ball_pos_x]
+    movss xmm1, dword [ball_pos_y]
+
+    mov eax, dword [screen_center_x]
+    cvtsi2ss xmm2, eax
+    mov eax, dword [screen_center_y] 
+    cvtsi2ss xmm3, eax
+    subss xmm0, xmm2
+    subss xmm1, xmm3
+
+    ; Calc mag of dir of ball from center. 
+    movss xmm2, xmm0
+    mulss xmm2, xmm2
+    movss xmm3, xmm1
+    mulss xmm3, xmm3,
+    addss xmm2, xmm3 ; Mag squared.  
+    movss xmm3, xmm0 ; Stash dir of ball from center {x}.
+    movss xmm0, xmm2
+    mov eax, [boundary_radius] 
+    cvtsi2ss xmm2, eax
+    mulss xmm2, xmm2 ; Boundary radius squared.  
+    comiss xmm0, xmm2 ; Check if ball is out of range.
+    ja _handleCollision_outsideBoundary
+    jmp _handleCollision_end ; If we are still within the boundary, there is no collision to handle.
+_handleCollision_outsideBoundary:
+    movss xmm2, dword [ball_pos_x] 
+    cvttss2si eax, xmm2
+    mov dword [x], eax
+    movss xmm2, dword [ball_pos_y]
+    cvttss2si eax, xmm2
+    mov dword [y], eax
+    movss xmm2, xmm0 ; Stash mag squared.
+    call _cosineOffset
+    comiss xmm0, dword [cos_pi_over_12]
+    ja _handleCollision_paddleContact ; If greater it means angle is smaller so there is contact.
+    call _exit ; Process just ends (for now) when we lose. 
+_handleCollision_paddleContact:
+    movss xmm0, xmm2 ; Restore mag squared.
+    call _sqrt
+    movss xmm2, xmm0 ; Store mag.
+    movss xmm0, xmm3 ; Restore dir from center {x}.
+
+    ; Normalise dir of ball from center. 
+    divss xmm0, xmm2
+    divss xmm1, xmm2 
+    
+    ; Dotprod of velocity vector with dir of ball from center.
+    movss xmm2, dword [ball_vel_x]
+    movss xmm3, dword [ball_vel_y]
+    mulss xmm2, xmm0
+    mulss xmm3, xmm1
+    addss xmm2, xmm3 ; Store dotprod
+
+    ; Ensure dotprod is non-negative.
+    mov eax, -1
+    cvtsi2ss xmm3, eax  
+    comiss xmm2, dword [zero]
+    ja _handleCollision_magPositive
+    mulss xmm2, xmm3 
+_handleCollision_magPositive:   
+    ; Require to move ball towards center by offset of radius to prevent 'bunny hopping' where collision handler triggers more than once, increasing speed of ball.
+    movss xmm4, xmm0
+    movss xmm5, xmm1
+    mov eax, dword [ball_radius]
+    cvtsi2ss xmm3, eax
+    mulss xmm4, xmm3
+    mulss xmm5, xmm3 
+    mulss xmm4, dword [minus_one]
+    mulss xmm5, dword [minus_one]
+    addss xmm4, dword [ball_pos_x]
+    addss xmm5, dword [ball_pos_y]
+    movss dword [ball_pos_x], xmm4
+    movss dword [ball_pos_y], xmm5 
+
+    ; Scale dir of ball from center.
+    mulss xmm0, xmm2
+    mulss xmm1, xmm2
+
+    ; Apply velocity reflection.
+    movss xmm2, dword [ball_vel_x]
+    movss xmm3, dword [ball_vel_y]
+    subss xmm2, xmm0
+    subss xmm2, xmm0
+    subss xmm3, xmm1
+    subss xmm3, xmm1
+
+    ; Multiply ball veclocity vector by small random rotation matrix.
+    movss xmm4, xmm2
+    movss xmm5, xmm3
+    call _randRotMat
+    mulss xmm0, xmm4
+    mulss xmm1, xmm5
+    addss xmm0, xmm1 ; Reflected and randomised [ball_vel_x].
+    mulss xmm2, xmm4
+    mulss xmm3, xmm5
+    addss xmm2, xmm3 ; Reflected and randomised [ball_vel_y].
+
+    ; TODO: Also figure out why the speed sometimes increases in velocity.
+
+    ; Save. 
+    movss dword [ball_vel_x], xmm0
+    movss dword [ball_vel_y], xmm2
+
+_handleCollision_end:
+    movss xmm0, dword [rsp + 0]
+    movss xmm1, dword [rsp + 4]
+    movss xmm2, dword [rsp + 8]
+    movss xmm3, dword [rsp + 12]
+    movss xmm4, dword [rsp + 16]
+    movss xmm5, dword [rsp + 20]
+    add rsp, 32
+    
+    pop rbp
+    pop rax
+    ret
+
+; Returns random anticlockwise rotation matrix.
+; @param - [random_offset_upper]
+; @param - [random_offset_lower]
+; @return - [[xmm0, xmm1], [xmm2, xmm3]] corrensponding to [[cos(x), -sin(x)], [sin(x), cos(x)]].
+_randRotMat:
+    movss xmm0, dword [rand_offset_lower]
+    movss xmm1, dword [rand_offset_upper]
+    call _randFloat
+    movss xmm3, xmm0 ; Stash random int in xmm3.
+    call _sine
+    movss xmm1, xmm0
+    movss xmm0, xmm3 ; Reload xmm0 with the random angle.
+    call _cosine
+    movss xmm3, xmm0
+    movss xmm2, xmm1
+    mulss xmm1, dword [minus_one]
+    
+    ret  
+
+; Generates a random float in a given range.
+; 
+; @param - xmm1 - lower bound.
+; @param - xmm2 - upper bound.
+; @return - xmm0 - random float in range.
+_randFloat:
+    push rax
+    push rbp
+    mov rbp, rsp
+
+    sub rsp, 16
+
+    movss dword [rsp + 0], xmm1
+    movss dword [rsp + 4], xmm2 
+
+_randFloat_loop: ; According to docs, hardware can take time to generate rand so requires polling
+    rdrand eax
+    jnc _randFloat_loop  
+    shr eax, 1 ; Ensures positive. 
+    subss xmm1, xmm0 ; Store range. 
+	cvtsi2ss xmm2, eax
+    mulss xmm2, [tiny] ; Range proportion (betwee 0 and 1).
+    
+    mulss xmm1, xmm2 ; Multiply range by random proportion.
+    addss xmm0, xmm1 ; Add min.
+    
+    movss xmm1, dword [rsp + 0]
+    movss xmm2, dword [rsp + 4]
+
+    add rsp, 16
+
+    pop rbp
+    pop rax
+    ret
 
 _exit:
 	; Close framebuffer device.
@@ -868,12 +1263,6 @@ _exit:
 	mov rax, SYS_CLOSE
 	mov edi, dword [kb_fd]
 	syscall
-
-	; Unmap framebuffer memory
-    ;mov rdi, qword [fb_ptr]
-    ;mov rsi, FB_SIZE  ; screensize
-    ;mov rax, 11 ; SYS_munmap
-    ;syscall
 
 	mov rax, SYS_EXIT
 	xor rdi, rdi
