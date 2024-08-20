@@ -25,8 +25,8 @@ KEY_CODE_LEFT_ARROW equ 105
 KEY_CODE_RIGHT_ARROW equ 106
 
 section .data
-    fb_device db "/dev/fb0", 0
-	kb_device db "/dev/input/event3", 0 ; 3 for inbuilt, 22 for wireless.
+    fb_device db FRAMEBUFFER, 0
+	kb_device db KEYBOARD_DEVICE, 0 ; 3 for inbuilt, 22 for wireless.
 
 	; Can be thought of as a cursor, refers to the pixel in the fb that is currently in focus.
 	x dd 0
